@@ -1,4 +1,4 @@
-
+# shellcheck disable=SC2148
 function velero_pre_init() {
     if [ -z "$VELERO_NAMESPACE" ]; then
         VELERO_NAMESPACE=velero
@@ -8,6 +8,7 @@ function velero_pre_init() {
     fi
 }
 
+# runs on first install, and on version upgrades only
 function velero() {
     local src="$DIR/addons/velero/$VELERO_VERSION"
     local dst="$DIR/kustomize/velero"
@@ -22,13 +23,27 @@ function velero() {
 
     velero_kotsadm_restore_config "$src" "$dst"
 
+    # always patch the velero and restic manifests to include the PVC case
+    velero_patch_internal_pvc_snapshots "$src" "$dst"
+
     velero_patch_http_proxy "$src" "$dst"
 
     velero_change_storageclass "$src" "$dst"
 
+    velero_migrate_from_object_store
+
     kubectl apply -k "$dst"
 
     kubectl label -n default --overwrite service/kubernetes velero.io/exclude-from-backup=true
+
+    # TODO (dans): wait for migration to finish and verify that the velero backups match? 
+    # This would be really hard since you can't force a sync of backup CRs, and in practive I couldn't find a way to tell
+    # that is was done with a sync.
+    if [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
+        logWarn "Velero will migrate from object store to pvc"
+        try_1m velero_pvc_migrated
+        logSuccess "Velero migration complete"
+    fi
 }
 
 function velero_join() {
@@ -40,56 +55,56 @@ function velero_install() {
     local dst="$2"
 
     # Pre-apply CRDs since kustomize reorders resources. Grep to strip out sailboat emoji.
-    $src/assets/velero-v${VELERO_VERSION}-linux-amd64/velero install --crds-only | grep -v 'Velero is installed'
+    "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero install --crds-only | grep -v 'Velero is installed'
 
     local resticArg="--use-restic"
     if [ "$VELERO_DISABLE_RESTIC" = "1" ]; then
         resticArg=""
     fi
 
-    # TODO (dans): find a better place to put this
-    determine_velero_pvc_size
-
-    # TODO (dans): detect if we need to use object store or pvc
+    # detect if we need to use object store or pvc
     local bslArgs="--no-default-backup-location"
     if ! kubernetes_resource_exists "$VELERO_NAMESPACE" backupstoragelocation default; then
-        bslArgs="--provider aws --bucket $VELERO_LOCAL_BUCKET --backup-location-config region=us-east-1,s3Url=${OBJECT_STORE_CLUSTER_HOST},publicUrl=http://${OBJECT_STORE_CLUSTER_IP},s3ForcePathStyle=true"
+        bslArgs="--provider replicated.com/pvc --bucket velero-internal-snapshots --backup-location-config storageSize=${VELERO_PVC_SIZE},resticRepoPrefix=/var/velero-local-volume-provider/velero-internal-snapshots/restic"
     fi
 
-    velero_credentials
+    # we only need a secret file if it's already set for some other provider (including legacy internal storage)
+    local secretArgs="--no-secret"
+    if kubernetes_resource_exists "$VELERO_NAMESPACE" secret cloud-credentials; then
+        velero_credentials
+        secretArgs="--secret-file velero-credentials"
+    fi
 
-    # TODO (dans): where does this function go?
-    velero_migrate_from_object_store
-
-    $src/assets/velero-v${VELERO_VERSION}-linux-amd64/velero install \
-        $resticArg \
-        $bslArgs \
-        --plugins velero/velero-plugin-for-aws:v1.2.0,velero/velero-plugin-for-gcp:v1.2.0,velero/velero-plugin-for-microsoft-azure:v1.2.0,replicated/local-volume-provider:v0.1.0,$KURL_UTIL_IMAGE \
-        --secret-file velero-credentials \
-        --use-volume-snapshots=false \
+    "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero install \
+        "$resticArg" \
+        "$bslArgs" \
+        "$secretArgs" \
         --namespace $VELERO_NAMESPACE \
-        --dry-run -o yaml > "$dst/velero.yaml"
+        --plugins velero/velero-plugin-for-aws:v1.2.0,velero/velero-plugin-for-gcp:v1.2.0,velero/velero-plugin-for-microsoft-azure:v1.2.0,replicated/local-volume-provider:v0.2.0,"$KURL_UTIL_IMAGE" \
+        --use-volume-snapshots=false \
+        --dry-run -o yaml > "$dst/velero.yaml" 
 
     rm velero-credentials
 }
 
+# This runs when re-applying the same version to a cluster
 function velero_already_applied() {
     local src="$DIR/addons/velero/$VELERO_VERSION"
     local dst="$DIR/kustomize/velero"
 
-    # The kustomize.yaml will be added by one of the methods below.
+    cp "$src/kustomization.yaml" "$dst/"
 
-    # TODO (dans): add kustomize.yaml
-    velero_change_storageclass "$src" "$dst" true
-
-    # TODO (dans): there is probably a bug here when we don't change the bsl location during a migration
-    # velero_migrate_from_rook_ceph
-
-    # TODO (dans): where does this function go?
+    # If we need to migrate, we're going to need to regenerate the velero manifests
     velero_migrate_from_object_store "$src" "$dst"
 
-    # TODO (dans): this probably need to be a kustomize file now
-    # This should only be applying the configmap if required
+    # If we didn't need to migrate, reset the kustomization file and only apply the configmap
+    if [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
+        velero_patch_internal_pvc_snapshots "$src" "$dst"
+    fi
+
+    velero_change_storageclass "$src" "$dst"
+
+    # In the case this is a rook re-apply, no changes might be required
     if [ -f "$dst/kustomization.yaml" ]; then
         kubectl apply -k "$dst"
     fi
@@ -97,26 +112,21 @@ function velero_already_applied() {
     # TODO (dans): wait for migration to finish and verify that the velero backups match? 
     # This would be really hard since you can't force a sync of backup CRs, and in practive I couldn't find a way to tell
     # that is was done with a sync.
+    if [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
+        logWarn "Velero will migrate from object store to pvc"
+        try_1m velero_pvc_migrated
+        logSuccess "Velero migration complete"
+    fi
 }
 
-# The --secret-file flag must always be used so that the generated velero deployment uses the
+# The --secret-file flag should be used so that the generated velero deployment uses the
 # cloud-credentials secret. Use the contents of that secret if it exists to avoid overwriting
-# any changes. Else if a local object store (Ceph/Minio) is configured, use its credentials.
+# any changes. 
 function velero_credentials() {
-   if kubernetes_resource_exists "$VELERO_NAMESPACE" secret cloud-credentials; then
-       kubectl -n velero get secret cloud-credentials -ojsonpath='{ .data.cloud }' | base64 -d > velero-credentials
-       return 0
+    if kubernetes_resource_exists "$VELERO_NAMESPACE" secret cloud-credentials; then
+        kubectl -n velero get secret cloud-credentials -ojsonpath='{ .data.cloud }' | base64 -d > velero-credentials
+        return 0
     fi
-
-    if [ -n "$OBJECT_STORE_CLUSTER_IP" ]; then
-        try_1m object_store_create_bucket "$VELERO_LOCAL_BUCKET"
-    fi
-
-    cat >velero-credentials <<EOF
-[default]
-aws_access_key_id=$OBJECT_STORE_ACCESS_KEY
-aws_secret_access_key=$OBJECT_STORE_SECRET_KEY
-EOF
 }
 
 function velero_patch_restic_privilege() {
@@ -145,12 +155,12 @@ function velero_binary() {
         curl -L "https://github.com/vmware-tanzu/velero/releases/download/v${VELERO_VERSION}/velero-v${VELERO_VERSION}-linux-amd64.tar.gz" > "$src/assets/velero.tar.gz"
     fi
 
-    pushd "$src/assets"
+    pushd "$src/assets" || exit 1
     tar xf "velero.tar.gz"
     if [ "$VELERO_DISABLE_CLI" != "1" ]; then
         cp velero-v${VELERO_VERSION}-linux-amd64/velero /usr/local/bin/velero
     fi
-    popd
+    popd || exit 1
 }
 
 function velero_kotsadm_restore_config() {
@@ -183,55 +193,52 @@ function velero_patch_http_proxy() {
 function velero_change_storageclass() {
     local src="$1"
     local dst="$2"
-    local disable_kustomization="$3"
 
     if kubectl get sc longhorn &> /dev/null && \
     [ "$(kubectl get sc longhorn -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}')" = "true" ]; then
-        render_yaml_file "$src/tmpl-change-storageclass.yaml" > "$dst/change-storageclass.yaml"
-        if [ -z "$disable_kustomization" ]; then
-            insert_resources "$dst/kustomization.yaml" change-storageclass.yaml
+
+        # when re-applying the same velero version, this might not exist.
+        if [ ! -f "$dst/kustomization.yaml" ]; then
+            cat > kustomization.yaml <<EOF
+resources:
+EOF
         fi
+
+        render_yaml_file "$src/tmpl-change-storageclass.yaml" > "$dst/change-storageclass.yaml"
+        insert_resources "$dst/kustomization.yaml" change-storageclass.yaml
+
     fi
 }
-
-function velero_migrate_from_rgw() {
-    # TODO (dans): update the backupstorage location to point to minio
-    velero-velero_credentials
-
-    rm velero-credentials
-
-}
-
 
 function velero_migrate_from_object_store() {
     local src="$1"
     local dst="$2"
 
-    if [ -n "$ROOK_VERSION" ] || [ -n "$MINIO_VERSION" ]; then # if there is still an object store, don't migrate
+    # if there is still an object store, don't migrate. If KOTSADM_DISABLE_S# is set, force the migration
+    if [ -z "$KOTSADM_DISABLE_S3" ] || [ -n "$ROOK_VERSION" ] || [ -n "$MINIO_VERSION" ]; then 
         return
     fi
 
+    # if an object store isn't installed don't migrate
     # TODO (dans): this doeesn't support minio in a non-standard namespace
-    if ! kubernetes_resource_exists rook-ceph deployment rook-ceph-rgw-rook-ceph-store-a || ! kubernetes_resource_exists minio deployment minio; then # if an object store isn't installed don't migrate
+    if ! kubernetes_resource_exists rook-ceph deployment rook-ceph-rgw-rook-ceph-store-a || ! kubernetes_resource_exists minio deployment minio; then 
         return
     fi
 
-    printf "\n${YELLOW}Installer has detected an object store was removed. Migrating internal snapshot data to a Persistent Volume.${NC}\n"
-
+    export INTERNAL_S3_HOST=
+    export INTERNAL_S3_ACCESS_KEY_ID=
+    export INTERNAL_S3_ACCESS_KEY_SECRET=
     if kubernetes_resource_exists rook-ceph deployment rook-ceph-rgw-rook-ceph-store-a; then 
         echo "Previous installation of Rook Ceph detected."
-        export INTERNAL_S3_HOST="rook-ceph-rgw-rook-ceph-store.rook-ceph"
-        export INTERNAL_S3_ACCESS_KEY_ID=$(kubectl -n rook-ceph get secret rook-ceph-object-user-rook-ceph-store-kurl -o yaml | grep AccessKey | head -1 | awk '{print $2}' | base64 --decode)
-        export INTERNAL_S3_ACCESS_KEY_SECRET=$(kubectl -n rook-ceph get secret rook-ceph-object-user-rook-ceph-store-kurl -o yaml | grep SecretKey | head -1 | awk '{print $2}' | base64 --decode)
+        INTERNAL_S3_HOST="rook-ceph-rgw-rook-ceph-store.rook-ceph"
+        INTERNAL_S3_ACCESS_KEY_ID=$(kubectl -n rook-ceph get secret rook-ceph-object-user-rook-ceph-store-kurl -o yaml | grep AccessKey | head -1 | awk '{print $2}' | base64 --decode)
+        INTERNAL_S3_ACCESS_KEY_SECRET=$(kubectl -n rook-ceph get secret rook-ceph-object-user-rook-ceph-store-kurl -o yaml | grep SecretKey | head -1 | awk '{print $2}' | base64 --decode)
     else 
         echo "Previous installation of Minio detected."
-        export INTERNAL_S3_HOST="minio.minio"
-        export INTERNAL_S3_ACCESS_KEY_ID=$(kubectl -n minio get secret minio-credentials -ojsonpath='{ .data.MINIO_ACCESS_KEY }' | base64 --decode)
-        export INTERNAL_S3_ACCESS_KEY_SECRET=$(kubectl -n minio get secret minio-credentials -ojsonpath='{ .data.MINIO_SECRET_KEY }' | base64 --decode)
+        INTERNAL_S3_HOST="minio.minio"
+        INTERNAL_S3_ACCESS_KEY_ID=$(kubectl -n minio get secret minio-credentials -ojsonpath='{ .data.MINIO_ACCESS_KEY }' | base64 --decode)
+        INTERNAL_S3_ACCESS_KEY_SECRET=$(kubectl -n minio get secret minio-credentials -ojsonpath='{ .data.MINIO_SECRET_KEY }' | base64 --decode)
     fi
-
-    # Sets $VELERO_PVC_SIZE
-    determine_velero_pvc_size
 
     # If this is run through `velero_already_applied`, we need to create base kustomization file
     if [ ! -f "$dst/kustomization.yaml" ];then
@@ -239,15 +246,6 @@ function velero_migrate_from_object_store() {
     fi
 
     # TODO (dans): figure out if there is enough space create a new volume with all the snapshot data
-
-    # Create a storage class that sets the volume reclaim policy to RETAIN
-    # This assumes that only longhorn is the only valid provider, and no one has modified the original storage class
-    cp "$src/internal-snaps-sc.yaml" "$dst/internal-snaps-sc.yaml"
-    insert_resources "$dst/kustomization.yaml" internal-snaps-sc.yaml
-
-    # create the PVC
-    render_yaml_file "$src/tmpl-internal-snaps-pvc.yaml" > "$dst/internal-snaps-pvc.yaml"
-    insert_resources "$dst/kustomization.yaml" s3-migration-secret.yaml
 
     # create secret for migration init container to pull from object store
     render_yaml_file "$src/tmpl-s3-migration-secret.yaml" > "$dst/s3-migration-secret.yaml"
@@ -257,21 +255,49 @@ function velero_migrate_from_object_store() {
     render_yaml_file "$src/tmpl-s3-migration-configmap.yaml" > "$dst/s3-migration-configmap.yaml"
     insert_resources "$dst/kustomization.yaml" s3-migration-configmap.yaml
 
-    # TODO (dans): add patch to add init container for migration
-    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/s3-migration-patch.yaml"
+    # add patch to add init container for migration
+    render_yaml_file "$src/tmpl-s3-migration-deployment-patch.yaml" > "$dst/s3-migration-deployment-patch.yaml"
+    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/s3-migration-deployment-patch.yaml"
 
-    # TODO (dans): add patch to add the pvc in the correct location for the velero deployment
+    # update the BackupstorageLocation
+    "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero backup-location delete default --confirm
+    "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero backup-location create default \
+        --default \
+        --bucket velero-internal-snapshots \
+        --provider replicated.com/pvc \
+        --config storageSize="${VELERO_PVC_SIZE}",resticRepoPrefix=/var/velero-local-volume-provider/velero-internal-snapshots/restic
 
-    # TODO (dans): add patch to add the pvc in the correct location for the restice daemonset
+    export WILL_MIGRATE_VELERO_OBJECT_STORE="1"
+}
 
-    # TODO (dans): Update the BackupstorageLocation
+# add patches for the velero and restic to the current kustomization file that setup the PVC setup like the 
+# velero LVP plugin requires 
+function velero_patch_internal_pvc_snapshots() {
+    local src="$1"
+    local dst="$2"
 
-    migrate_rgw_to_minio
-    export DID_MIGRATE_ROOK_OBJECT_STORE="1"
+    determine_velero_pvc_size
+
+    # Create a storage class that sets the volume reclaim policy to RETAIN
+    # This assumes that only longhorn is the only valid provider, and no one has modified the original storage class
+    cp "$src/internal-snaps-sc.yaml" "$dst/internal-snaps-sc.yaml"
+    insert_resources "$dst/kustomization.yaml" internal-snaps-sc.yaml
+
+    # create the PVC
+    render_yaml_file "$src/tmpl-internal-snaps-pvc.yaml" > "$dst/internal-snaps-pvc.yaml"
+    insert_resources "$dst/kustomization.yaml" tmpl-internal-snaps-pvc.yaml
+
+    # add patch to add the pvc in the correct location for the velero deployment
+    render_yaml_file "$src/tmpl-internal-pvc-deployment-patch.yaml" > "$dst/internal-pvc-deployment-patch.yaml"
+    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/internal-pvc-deployment-patch.yaml"
+
+    # add patch to add the pvc in the correct location for the restic daemonset
+    render_yaml_file "$src/tmpl-internal-pvc-ds-patch.yaml" > "$dst/internal-pvc-ds-patch.yaml"
+    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/internal-pvc-ds-patch.yaml"
 
 }
 
-function registry_pvc_exists() {
+function velero_pvc_exists() {
     kubectl -n "${VELERO_NAMESPACE}" get pvc velero-internal-snapshots &>/dev/null
 }
 
@@ -285,9 +311,7 @@ function determine_velero_pvc_size() {
     export VELERO_PVC_SIZE=$velero_pvc_size
 }
 
-# Useful stuff
-    # if [ "$will_migrate_pvc" = "1" ]; then
-    #     logWarn "Registry will migrate from object store to pvc"
-    #     try_1m registry_pvc_migrated
-    #     logSuccess "Registry migration complete"
-    # fi
+function velero_pvc_migrated() {
+    velero_pod=$( kubectl get pods -n velero -l component=velero -o jsonpath='{.items[0].metadata.name}')
+    kubectl -n velero logs "$velero_pod" -c migrate-s3  | grep -q "migration ran successfully" &>/dev/null
+}
