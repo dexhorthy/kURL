@@ -44,6 +44,14 @@ function velero() {
         try_1m velero_pvc_migrated
         logSuccess "Velero migration complete"
     fi
+
+    # Patch snapshots volumes to "Retain" in case of deletion
+    if kubernetes_resource_exists "$VELERO_NAMESPACE" pvc velero-internal-snapshots; then
+        local velero_pv_name
+        echo "Patching internal snapshot volume Reclaim Policy to RECLAIM"
+        velero_pv_name=$(kubectl get pvc velero-internal-snapshots -n ${VELERO_NAMESPACE} -ojsonpath='{.spec.volumeName}')
+        kubectl patch pv "$velero_pv_name" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+    fi
 }
 
 function velero_join() {
@@ -116,6 +124,14 @@ function velero_already_applied() {
         logWarn "Velero will migrate from object store to pvc"
         try_1m velero_pvc_migrated
         logSuccess "Velero migration complete"
+    fi
+
+    # Patch snapshots volumes to "Retain" in case of deletion
+    if kubernetes_resource_exists "$VELERO_NAMESPACE" pvc velero-internal-snapshots && [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
+        local velero_pv_name
+        echo "Patching internal snapshot volume Reclaim Policy to RECLAIM"
+        velero_pv_name=$(kubectl get pvc velero-internal-snapshots -n ${VELERO_NAMESPACE} -ojsonpath='{.spec.volumeName}')
+        kubectl patch pv "$velero_pv_name" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
     fi
 }
 
@@ -278,10 +294,11 @@ function velero_patch_internal_pvc_snapshots() {
 
     determine_velero_pvc_size
 
-    # Create a storage class that sets the volume reclaim policy to RETAIN
-    # This assumes that only longhorn is the only valid provider, and no one has modified the original storage class
-    cp "$src/internal-snaps-sc.yaml" "$dst/internal-snaps-sc.yaml"
-    insert_resources "$dst/kustomization.yaml" internal-snaps-sc.yaml
+    # If we are migrating from Rook to Longhorn, longhorn is not yes the default storage class.
+    export VELERO_PVC_STORAGE_CLASS="default" # this is the rook-ceph default storage class
+    if [ -n "$LONGHORN_VERSION" ]; then
+        export VELERO_PVC_STORAGE_CLASS="longhorn"
+    fi
 
     # create the PVC
     render_yaml_file "$src/tmpl-internal-snaps-pvc.yaml" > "$dst/internal-snaps-pvc.yaml"

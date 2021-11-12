@@ -3,7 +3,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: velero-internal-snapshots
 spec:
-  storageClassName: longhorn-retain
+  storageClassName: ${VELERO_PVC_STORAGE_CLASS}
   accessModes:
     - ReadWriteMany
   resources:
