@@ -6,6 +6,10 @@ function velero_pre_init() {
     if [ -z "$VELERO_LOCAL_BUCKET" ]; then
         VELERO_LOCAL_BUCKET=velero
     fi
+    # TODO (dans): make this configurable from the installer spec
+    # if [ -z "$VELERO_REQUESTED_CLAIM_SIZE" ]; then
+    #     VELERO_REQUESTED_CLAIM_SIZE="50Gi"
+    # fi
 }
 
 # runs on first install, and on version upgrades only
@@ -36,9 +40,7 @@ function velero() {
 
     kubectl label -n default --overwrite service/kubernetes velero.io/exclude-from-backup=true
 
-    # TODO (dans): wait for migration to finish and verify that the velero backups match? 
-    # This would be really hard since you can't force a sync of backup CRs, and in practive I couldn't find a way to tell
-    # that is was done with a sync.
+    # Bail if the migratoin fails, preventing the original object store from being deleted
     if [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
         logWarn "Velero will migrate from object store to pvc"
         try_1m velero_pvc_migrated
@@ -117,9 +119,7 @@ function velero_already_applied() {
         kubectl apply -k "$dst"
     fi
 
-    # TODO (dans): wait for migration to finish and verify that the velero backups match? 
-    # This would be really hard since you can't force a sync of backup CRs, and in practive I couldn't find a way to tell
-    # that is was done with a sync.
+    # Bail if the migratoin fails, preventing the original object store from being deleted
     if [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
         logWarn "Velero will migrate from object store to pvc"
         try_1m velero_pvc_migrated
@@ -229,6 +229,11 @@ EOF
 function velero_migrate_from_object_store() {
     local src="$1"
     local dst="$2"
+
+    # TODO (dans): remove this feature flag when/if we decide to ship migration
+    if [ -z "$BETA_VELERO_MIGRATE_FROM_OBJECT_STORE" ]; then 
+        return
+    fi
 
     # if there is still an object store, don't migrate. If KOTSADM_DISABLE_S# is set, force the migration
     if [ -z "$KOTSADM_DISABLE_S3" ] || [ -n "$ROOK_VERSION" ] || [ -n "$MINIO_VERSION" ]; then 
