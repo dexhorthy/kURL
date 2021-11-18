@@ -3,7 +3,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: velero-internal-snapshots
   labels:
-    velero.io/exclude-from-backup: "true"
+    velero.io/exclude-from-backup: \"true\"
 spec:
   storageClassName: ${VELERO_PVC_STORAGE_CLASS}
   accessModes:

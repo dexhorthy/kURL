@@ -17,9 +17,11 @@ function velero() {
     local src="$DIR/addons/velero/$VELERO_VERSION"
     local dst="$DIR/kustomize/velero"
 
-    cp "$src/kustomization.yaml" "$dst/"
+    render_yaml_file "$src/tmpl-kustomization.yaml" > "$dst/kustomization.yaml"
 
     velero_binary
+
+    determine_velero_pvc_size
 
     velero_install "$src" "$dst"
 
@@ -49,8 +51,10 @@ function velero() {
 
     # Patch snapshots volumes to "Retain" in case of deletion
     if kubernetes_resource_exists "$VELERO_NAMESPACE" pvc velero-internal-snapshots; then
+
         local velero_pv_name
         echo "Patching internal snapshot volume Reclaim Policy to RECLAIM"
+        try_1m velero_pvc_bound
         velero_pv_name=$(kubectl get pvc velero-internal-snapshots -n ${VELERO_NAMESPACE} -ojsonpath='{.spec.volumeName}')
         kubectl patch pv "$velero_pv_name" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
     fi
@@ -63,6 +67,7 @@ function velero_join() {
 function velero_install() {
     local src="$1"
     local dst="$2"
+    local has_secret
 
     # Pre-apply CRDs since kustomize reorders resources. Grep to strip out sailboat emoji.
     "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero install --crds-only | grep -v 'Velero is installed'
@@ -81,20 +86,23 @@ function velero_install() {
     # we only need a secret file if it's already set for some other provider (including legacy internal storage)
     local secretArgs="--no-secret"
     if kubernetes_resource_exists "$VELERO_NAMESPACE" secret cloud-credentials; then
+        has_secret
         velero_credentials
         secretArgs="--secret-file velero-credentials"
     fi
 
     "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero install \
-        "$resticArg" \
-        "$bslArgs" \
-        "$secretArgs" \
+        $resticArg \
+        $bslArgs \
+        $secretArgs \
         --namespace $VELERO_NAMESPACE \
         --plugins velero/velero-plugin-for-aws:v1.2.0,velero/velero-plugin-for-gcp:v1.2.0,velero/velero-plugin-for-microsoft-azure:v1.2.0,replicated/local-volume-provider:v0.2.0,"$KURL_UTIL_IMAGE" \
         --use-volume-snapshots=false \
         --dry-run -o yaml > "$dst/velero.yaml" 
 
-    rm velero-credentials
+    if [ -n "$has_secret" ]; then
+        rm velero-credentials
+    fi
 }
 
 # This runs when re-applying the same version to a cluster
@@ -102,7 +110,9 @@ function velero_already_applied() {
     local src="$DIR/addons/velero/$VELERO_VERSION"
     local dst="$DIR/kustomize/velero"
 
-    cp "$src/kustomization.yaml" "$dst/"
+    render_yaml_file "$src/tmpl-kustomization.yaml" > "$dst/kustomization.yaml"
+
+    determine_velero_pvc_size
 
     # If we need to migrate, we're going to need to regenerate the velero manifests
     velero_migrate_from_object_store "$src" "$dst"
@@ -130,6 +140,7 @@ function velero_already_applied() {
     if kubernetes_resource_exists "$VELERO_NAMESPACE" pvc velero-internal-snapshots && [ "$WILL_MIGRATE_VELERO_OBJECT_STORE" = "1" ]; then
         local velero_pv_name
         echo "Patching internal snapshot volume Reclaim Policy to RECLAIM"
+        try_1m velero_pvc_bound
         velero_pv_name=$(kubectl get pvc velero-internal-snapshots -n ${VELERO_NAMESPACE} -ojsonpath='{.spec.volumeName}')
         kubectl patch pv "$velero_pv_name" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
     fi
@@ -216,6 +227,8 @@ function velero_change_storageclass() {
         # when re-applying the same velero version, this might not exist.
         if [ ! -f "$dst/kustomization.yaml" ]; then
             cat > kustomization.yaml <<EOF
+namespace: ${VELERO_NAMESPACE}
+
 resources:
 EOF
         fi
@@ -263,7 +276,7 @@ function velero_migrate_from_object_store() {
 
     # If this is run through `velero_already_applied`, we need to create base kustomization file
     if [ ! -f "$dst/kustomization.yaml" ];then
-        cp "$src/kustomization.yaml" "$dst/"
+        render_yaml_file "$src/tmpl-kustomization.yaml" > "$dst/kustomization.yaml"
     fi
 
     # TODO (dans): figure out if there is enough space create a new volume with all the snapshot data
@@ -278,7 +291,7 @@ function velero_migrate_from_object_store() {
 
     # add patch to add init container for migration
     render_yaml_file "$src/tmpl-s3-migration-deployment-patch.yaml" > "$dst/s3-migration-deployment-patch.yaml"
-    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/s3-migration-deployment-patch.yaml"
+    insert_patches_strategic_merge "$dst/kustomization.yaml" s3-migration-deployment-patch.yaml
 
     # update the BackupstorageLocation
     "$src"/assets/velero-v"${VELERO_VERSION}"-linux-amd64/velero backup-location delete default --confirm
@@ -297,8 +310,6 @@ function velero_patch_internal_pvc_snapshots() {
     local src="$1"
     local dst="$2"
 
-    determine_velero_pvc_size
-
     # If we are migrating from Rook to Longhorn, longhorn is not yes the default storage class.
     export VELERO_PVC_STORAGE_CLASS="default" # this is the rook-ceph default storage class
     if [ -n "$LONGHORN_VERSION" ]; then
@@ -307,16 +318,20 @@ function velero_patch_internal_pvc_snapshots() {
 
     # create the PVC
     render_yaml_file "$src/tmpl-internal-snaps-pvc.yaml" > "$dst/internal-snaps-pvc.yaml"
-    insert_resources "$dst/kustomization.yaml" tmpl-internal-snaps-pvc.yaml
+    insert_resources "$dst/kustomization.yaml" internal-snaps-pvc.yaml
 
     # add patch to add the pvc in the correct location for the velero deployment
-    render_yaml_file "$src/tmpl-internal-pvc-deployment-patch.yaml" > "$dst/internal-pvc-deployment-patch.yaml"
-    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/internal-pvc-deployment-patch.yaml"
+    render_yaml_file "$src/tmpl-internal-snaps-deployment-patch.yaml" > "$dst/internal-snaps-deployment-patch.yaml"
+    insert_patches_strategic_merge "$dst/kustomization.yaml" internal-snaps-deployment-patch.yaml
 
     # add patch to add the pvc in the correct location for the restic daemonset
-    render_yaml_file "$src/tmpl-internal-pvc-ds-patch.yaml" > "$dst/internal-pvc-ds-patch.yaml"
-    insert_patches_strategic_merge "$dst/kustomization.yaml" "$src/patches/internal-pvc-ds-patch.yaml"
+    render_yaml_file "$src/tmpl-internal-snaps-ds-patch.yaml" > "$dst/internal-snaps-ds-patch.yaml"
+    insert_patches_strategic_merge "$dst/kustomization.yaml" internal-snaps-ds-patch.yaml
 
+}
+
+function velero_pvc_bound() {
+    kubectl get pvc velero-internal-snapshots -n ${VELERO_NAMESPACE} -oyaml | grep -q "phase: Bound"
 }
 
 function velero_pvc_exists() {
