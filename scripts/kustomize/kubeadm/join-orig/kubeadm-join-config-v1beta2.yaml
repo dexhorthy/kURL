@@ -6,11 +6,11 @@ metadata:
 nodeRegistration:
   taints: []
   kubeletExtraArgs:
-    node-ip: $PRIVATE_ADDRESS
+    node-ip: "$PRIVATE_ADDRESS"
     node-labels: "kurl.sh/cluster=true"
 discovery:
   bootstrapToken:
-    token: $KUBEADM_TOKEN
-    apiServerEndpoint: $API_SERVICE_ADDRESS
+    token: "$KUBEADM_TOKEN"
+    apiServerEndpoint: "$API_SERVICE_ADDRESS"
     caCertHashes:
-    - $KUBEADM_TOKEN_CA_HASH
+    - "$KUBEADM_TOKEN_CA_HASH"

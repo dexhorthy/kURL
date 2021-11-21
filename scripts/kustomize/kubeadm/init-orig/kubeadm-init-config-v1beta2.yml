@@ -12,11 +12,11 @@ bootstrapTokens:
   - signing
   - authentication
 localAPIEndpoint:
-  advertiseAddress: $PRIVATE_ADDRESS
+  advertiseAddress: "$PRIVATE_ADDRESS"
 nodeRegistration:
   taints: [] # prevent the default master taint
-  name: $HOSTNAME
+  name: "$HOSTNAME"
   kubeletExtraArgs:
     node-labels: "kurl.sh/cluster=true"
-    hostname-override: $HOSTNAME
-    node-ip: $PRIVATE_ADDRESS
+    hostname-override: "$HOSTNAME"
+    node-ip: "$PRIVATE_ADDRESS"
